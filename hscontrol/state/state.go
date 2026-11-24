@@ -30,6 +30,7 @@ import (
 	hsdb "github.com/juanfont/headscale/hscontrol/db"
 	"github.com/juanfont/headscale/hscontrol/derp"
 	"github.com/juanfont/headscale/hscontrol/policy"
+	"github.com/juanfont/headscale/hscontrol/policy/governance"
 	"github.com/juanfont/headscale/hscontrol/policy/matcher"
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/types/change"
@@ -230,6 +231,15 @@ type State struct {
 	configDERPMap *tailcfg.DERPMap
 	// polMan handles policy evaluation and management
 	polMan policy.PolicyManager
+
+	// governance owns the additive allow/deny explanation and incremental
+	// recomputation compilation. It is inactive for legacy policies without a
+	// governance document.
+	governance *governance.Service
+
+	// lastGovernanceReport is produced while holding policyMu during a policy
+	// install. UpdatePolicyIf turns its targeted refresh nodes into changes.
+	lastGovernanceReport *governance.CommitReport
 
 	// policyMu makes storing, loading and installing a policy one step, so
 	// policies land in the database in the order they are installed.
@@ -449,6 +459,7 @@ func NewState(cfg *types.Config) (*State, error) {
 		db:                  db,
 		ipAlloc:             ipAlloc,
 		polMan:              polMan,
+		governance:          governance.NewService(),
 		authCacheMaxEntries: cacheMaxEntries,
 		authCacheExpiration: cacheExpiration,
 		nodeStore:           nodeStore,
@@ -456,6 +467,12 @@ func NewState(cfg *types.Config) (*State, error) {
 
 		sshCheckAuth:  make(map[sshCheckPair]sshCheckAuthRecord),
 		registerLocks: xsync.NewMap[key.MachinePublic, *registerLock](),
+	}
+
+	// Activate any governance section loaded from the stored policy before the
+	// State is published. SSH confirmations are empty during construction.
+	if pol != nil {
+		s.applyGovernancePolicyLocked(pol)
 	}
 
 	// Last: NewLRU starts the TTL sweeper goroutine, which only Close stops.
@@ -614,10 +631,20 @@ func (s *State) reloadPolicyLocked() (bool, bool, error) {
 	// then. The policy API handlers always get here that way: they apply
 	// the policy with [State.SetPolicy], which rebuilds, store it, and
 	// reload the very same bytes.
+	// Install the additive governance compilation from the same bytes. This
+	// must happen before the policyChanged invalidation block so targeted SSH
+	// reevaluation can use the new atomic compilation.
+	govReport := s.applyGovernancePolicyLocked(pol)
+
 	if policyChanged {
-		// Stale approvals must not persist if checkPeriod rules are modified
-		// or removed.
-		s.ClearSSHCheckAuth()
+		if govReport != nil {
+			govReport.InvalidatedAuthorizations = s.invalidateGovernanceAuth(govReport)
+		} else {
+			// Legacy policies have no tuple-level recompilation record; retain
+			// the existing conservative behavior.
+			s.ClearSSHCheckAuth()
+		}
+
 		s.nodeStore.RebuildPeerMaps()
 		log.Info().Msg("Policy reload completed with changes")
 	}
@@ -1786,6 +1813,10 @@ func (s *State) Filter() ([]tailcfg.FilterRule, []matcher.Match) {
 
 // FilterForNode returns filter rules for a specific node, handling autogroup:self per-node.
 func (s *State) FilterForNode(node types.NodeView) ([]tailcfg.FilterRule, error) {
+	if rules, active := s.governance.FilterRulesForNode(node.ID()); active {
+		return rules, nil
+	}
+
 	return s.polMan.FilterForNode(node)
 }
 
@@ -1935,6 +1966,10 @@ func (s *State) ValidatePolicy(pol []byte) error {
 		return invalidPolicyError{err}
 	}
 
+	if err := s.ValidateGovernancePolicy(pol); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -1977,6 +2012,13 @@ func (s *State) UpdatePolicyIf(pol []byte, match func(stored string) bool) (*typ
 		}
 	}
 
+	// Re-run the governance trial against the snapshot under policyMu. The
+	// earlier ValidatePolicy call is the API convenience check; this closes
+	// the identity-snapshot race before any database write.
+	if err := s.ValidateGovernancePolicy(pol); err != nil {
+		return nil, nil, err
+	}
+
 	stored, err := s.db.SetPolicy(string(pol))
 	if err != nil {
 		return nil, nil, fmt.Errorf("storing policy: %w", err)
@@ -1989,8 +2031,14 @@ func (s *State) UpdatePolicyIf(pol []byte, match func(stored string) bool) (*typ
 
 	var changes []change.Change
 
-	// As on SaaS, a write that changes nothing sends clients nothing.
-	if changed {
+	// Governance commits know the exact destination filters that changed.
+	// Send targeted policy frames instead of a tailnet-wide recompute.
+	if report := s.lastGovernanceReport; report != nil {
+		for _, nodeID := range report.RefreshNodes {
+			changes = append(changes, change.TargetedPolicyChange(nodeID))
+		}
+	} else if changed {
+		// As on SaaS, a write that changes nothing sends clients nothing.
 		changes = append(changes, change.PolicyChange())
 	}
 
@@ -2547,12 +2595,9 @@ func (s *State) GetLastSSHAuth(src, dst types.NodeID) (time.Time, bool) {
 }
 
 // ClearSSHCheckAuth clears all recorded SSH check auth times.
-// Called when the policy changes to ensure stale auth times don't grant access.
+// Called when a legacy policy changes to ensure stale auth times don't grant access.
 func (s *State) ClearSSHCheckAuth() {
-	s.sshCheckMu.Lock()
-	defer s.sshCheckMu.Unlock()
-
-	s.sshCheckAuth = make(map[sshCheckPair]sshCheckAuthRecord)
+	_ = s.ClearSSHCheckAuthCounted()
 }
 
 // preserveNetInfo preserves NetInfo from an existing node for faster DERP connectivity.

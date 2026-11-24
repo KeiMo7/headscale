@@ -509,6 +509,17 @@ func PolicyChange() Change {
 	}
 }
 
+// TargetedPolicyChange refreshes only one node's packet filter after an
+// incremental governance change. It intentionally does not request runtime
+// peer recomputation or fan out to other connections.
+func TargetedPolicyChange(nodeID types.NodeID) Change {
+	return Change{
+		Reason:        "targeted policy change",
+		TargetNode:    nodeID,
+		IncludePolicy: true,
+	}
+}
+
 // DNSConfig creates a response for DNS configuration updates.
 func DNSConfig() Change {
 	return Change{

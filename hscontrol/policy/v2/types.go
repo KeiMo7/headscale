@@ -2154,6 +2154,11 @@ type Policy struct {
 	SSHTests            []SSHPolicyTest    `json:"sshTests,omitempty"`
 	RandomizeClientPort bool               `json:"randomizeClientPort,omitempty"`
 
+	// Governance carries the additive allow/deny/explain document. The v2
+	// compiler intentionally does not evaluate it; State derives both
+	// explanations and node allow-lists from hscontrol/policy/governance.
+	Governance any `json:"governance,omitempty"`
+
 	// DERPMap changes the DERP map served to every node, as a Tailscale
 	// policy's derpMap does; see [validateDERPMap].
 	DERPMap *tailcfg.DERPMap `json:"derpMap,omitempty"`

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/juanfont/headscale/hscontrol/policy/governance"
 	"github.com/juanfont/headscale/hscontrol/types"
 )
 
@@ -27,6 +28,10 @@ type PolicyRequestBody struct {
 type PolicyResponseBody struct {
 	Policy    string    `json:"policy"`
 	UpdatedAt time.Time `json:"updatedAt"`
+
+	// GovernanceReport is only populated for writes containing an additive
+	// governance document. It is omitted from legacy policy responses.
+	GovernanceReport *governance.CommitReport `json:"governanceReport,omitempty"`
 }
 
 type (
@@ -47,6 +52,13 @@ type (
 	}
 	checkPolicyOutput struct {
 		Body struct{}
+	}
+
+	explainPolicyInput struct {
+		Body governance.ExplainRequest
+	}
+	explainPolicyOutput struct {
+		Body *governance.Explanation
 	}
 )
 
@@ -114,7 +126,7 @@ func registerPolicy(api huma.API, b Backend) {
 			)
 		}
 
-		updated, cs, err := b.State.UpdatePolicy([]byte(in.Body.Policy))
+		updated, report, cs, err := b.State.UpdatePolicyWithReport([]byte(in.Body.Policy))
 		b.Change(cs...)
 
 		if err != nil {
@@ -124,6 +136,7 @@ func registerPolicy(api huma.API, b Backend) {
 		out := &setPolicyOutput{}
 		out.Body.Policy = updated.Data
 		out.Body.UpdatedAt = updated.UpdatedAt
+		out.Body.GovernanceReport = report
 
 		return out, nil
 	})
@@ -143,5 +156,32 @@ func registerPolicy(api huma.API, b Backend) {
 		}
 
 		return &checkPolicyOutput{}, nil
+	})
+
+	huma.Register(api, huma.Operation{
+		OperationID: "explainPolicy",
+		Method:      http.MethodPost,
+		Path:        "/api/v1/policy/explain",
+		Summary:     "Explain a policy decision",
+		Description: "Returns allow/deny verdict, hit rules, identity resolution trace and stable reason codes.",
+		Tags:        []string{"Policy"},
+		Security:    bearerAuth,
+	}, func(ctx context.Context, in *explainPolicyInput) (*explainPolicyOutput, error) {
+		explanation, err := b.State.ExplainGovernance(in.Body)
+		if err != nil {
+			if governance.IsClass(err, governance.ClassIdentityUnknown) {
+				return nil, huma.Error404NotFound("identity unknown", err)
+			}
+
+			if governance.IsClass(err, governance.ClassInvalidAction) ||
+				governance.IsClass(err, governance.ClassPortOutOfRange) ||
+				governance.IsClass(err, governance.ClassInvalidPolicy) {
+				return nil, huma.Error400BadRequest("invalid explanation request", err)
+			}
+
+			return nil, mapError("explaining policy", err)
+		}
+
+		return &explainPolicyOutput{Body: explanation}, nil
 	})
 }
